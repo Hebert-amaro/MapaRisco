@@ -1,4 +1,7 @@
-import { useState, useCallback } from 'react';
+import { useState } from 'react';
+import L from 'leaflet';
+import { MapContainer, Marker, TileLayer } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
 import { CAMPUS_DATA, getBlockStats, getRoomStats, type Block, type Room, type Risk, type RiskLevel, type RiskStatus, ALL_RISKS } from './data';
 
 // ─── Risk Level Helpers ───────────────────────────────────────────────────────
@@ -35,6 +38,46 @@ function levelIcon(level: RiskLevel) {
     case 'baixo': return '●';
   }
 }
+
+type RiskTypeKey = 'fisico' | 'quimico' | 'biologico' | 'ergonomico' | 'acidente';
+
+const RISK_TYPE_THEME: Record<RiskTypeKey, { label: string; color: string; bg: string; border: string; icon: string }> = {
+  fisico: { label: 'Físico', color: '#2e7d32', bg: '#eef8ef', border: '#a8d5ad', icon: '●' },
+  quimico: { label: 'Químico', color: '#c62828', bg: '#fff0ef', border: '#efb4ad', icon: '◆' },
+  biologico: { label: 'Biológico', color: '#795548', bg: '#f7f1ee', border: '#d2b8ad', icon: '✚' },
+  ergonomico: { label: 'Ergonômico', color: '#a66a00', bg: '#fff8d7', border: '#e9c85e', icon: '■' },
+  acidente: { label: 'Acidente', color: '#1565c0', bg: '#edf5ff', border: '#a8cdf7', icon: '▲' },
+};
+
+function normalizeText(value: string) {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
+function riskTypeFromCategory(category: string): RiskTypeKey {
+  const normalized = normalizeText(category);
+
+  if (normalized.includes('quim') || normalized.includes('gas')) return 'quimico';
+  if (normalized.includes('biolog') || normalized.includes('residuo') || normalized.includes('sanitario')) return 'biologico';
+  if (normalized.includes('ergonom') || normalized.includes('iluminacao') || normalized.includes('postura')) return 'ergonomico';
+  if (normalized.includes('ruido') || normalized.includes('vibracao') || normalized.includes('temperatura') || normalized.includes('radiacao')) return 'fisico';
+
+  return 'acidente';
+}
+
+function riskTypeTheme(category: string) {
+  return RISK_TYPE_THEME[riskTypeFromCategory(category)];
+}
+
+function getActiveRisksFromBlock(block: Block) {
+  return block.floors
+    .flatMap(floor => floor.rooms.flatMap(room => room.risks))
+    .filter(risk => risk.status !== 'resolvido' && risk.status !== 'rejeitado');
+}
+
+function getDominantRisk(risks: Risk[]) {
+  const order: RiskLevel[] = ['critico', 'alto', 'moderado', 'baixo'];
+  return [...risks].sort((a, b) => order.indexOf(a.level) - order.indexOf(b.level))[0] ?? null;
+}
 function statusLabel(status: RiskStatus) {
   switch (status) {
     case 'pendente': return 'Pendente';
@@ -70,18 +113,19 @@ function roomTypeLabel(type: string) {
 
 // ─── Small Shared Components ──────────────────────────────────────────────────
 
-function RiskBadge({ level, size = 'sm' }: { level: RiskLevel; size?: 'sm' | 'md' }) {
+function RiskBadge({ level, category, size = 'sm' }: { level: RiskLevel; category?: string; size?: 'sm' | 'md' }) {
   const pad = size === 'md' ? '3px 10px' : '2px 7px';
   const fontSize = size === 'md' ? '12px' : '11px';
+  const theme = category ? riskTypeTheme(category) : null;
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 4,
-      background: levelBg(level), color: levelColor(level),
+      background: theme?.bg ?? levelBg(level), color: theme?.color ?? levelColor(level),
       borderRadius: 5, padding: pad, fontWeight: 600, fontSize,
-      border: `1px solid ${levelColor(level)}22`,
+      border: `1px solid ${theme?.border ?? `${levelColor(level)}22`}`,
     }}>
-      <span style={{ fontSize: size === 'md' ? 9 : 8 }}>{levelIcon(level)}</span>
-      {levelLabel(level)}
+      <span style={{ fontSize: size === 'md' ? 9 : 8 }}>{theme?.icon ?? levelIcon(level)}</span>
+      {theme ? `${theme.label} · ${levelLabel(level)}` : levelLabel(level)}
     </span>
   );
 }
@@ -138,12 +182,40 @@ function ScoreBar({ value, max = 5, color }: { value: number; max?: number; colo
 
 // ─── Campus Map ───────────────────────────────────────────────────────────────
 
-const CAMPUS_MAP_MARKERS = [
-  { id: 'ceei', x: 160, y: 89 },
-  { id: 'caa', x: 514, y: 253 },
-  { id: 'cct', x: 1105, y: 271 },
-  { id: 'biblioteca', x: 453, y: 465 },
-] as const;
+const CAMPUS_CENTER: [number, number] = [-7.2139, -35.9088];
+const MAP_MIN_ZOOM = 15;
+const MAP_INITIAL_ZOOM = 17;
+const MAP_MAX_ZOOM = 19;
+
+const LOCATION_MARKERS = [
+  {
+    id: 'cw2-lab-quimica-analitica',
+    blockId: 'cw2',
+    position: [-7.21297969766558, -35.90613289321617],
+  },
+] as const satisfies readonly {
+  id: string;
+  blockId: string;
+  position: [number, number];
+}[];
+
+function createBuildingMarkerIcon({ selected }: { selected: boolean }) {
+  const width = selected ? 86 : 76;
+  const height = selected ? 64 : 56;
+
+  return L.divIcon({
+    className: 'building-leaflet-marker',
+    html: `
+      <div class="building-leaflet-marker__button" style="
+        width:${width}px;
+        height:${height}px;
+      "></div>
+    `,
+    iconSize: [width, height],
+    iconAnchor: [width / 2, height / 2],
+    popupAnchor: [0, -height / 2],
+  });
+}
 
 function CampusMap({
   selectedBlockId,
@@ -152,79 +224,43 @@ function CampusMap({
   selectedBlockId: string | null;
   onSelectBlock: (id: string) => void;
 }) {
-  const [hoveredBlock, setHoveredBlock] = useState<string | null>(null);
-  const [tooltip, setTooltip] = useState<{ x: number; y: number; block: Block } | null>(null);
-
-  const handleMouseMove = useCallback((e: React.MouseEvent<SVGElement>, block: Block) => {
-    const rect = (e.currentTarget as SVGElement).closest('svg')!.getBoundingClientRect();
-    setTooltip({ x: e.clientX - rect.left, y: e.clientY - rect.top, block });
-  }, []);
-
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-      <svg
-        viewBox="0 0 1124 522"
-        preserveAspectRatio="xMidYMid meet"
+      <MapContainer
+        center={CAMPUS_CENTER}
+        zoom={MAP_INITIAL_ZOOM}
+        minZoom={MAP_MIN_ZOOM}
+        maxZoom={MAP_MAX_ZOOM}
+        scrollWheelZoom
         style={{ width: '100%', height: '100%', background: '#eef1f4' }}
-        aria-label="Mapa do campus da UFCG com pontos de risco monitorados"
+        aria-label="Mapa real do campus da UFCG com pontos de risco monitorados"
       >
-        <image
-          href="/mapa-ufcg.png"
-          width="1124"
-          height="522"
-          preserveAspectRatio="none"
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+          maxNativeZoom={MAP_MAX_ZOOM}
+          maxZoom={MAP_MAX_ZOOM}
+          noWrap
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
 
-        {/* Interactive risk markers positioned over real campus locations. */}
-        {CAMPUS_MAP_MARKERS.map(marker => {
-          const block = CAMPUS_DATA.find(item => item.id === marker.id);
+        {LOCATION_MARKERS.map(location => {
+          const block = CAMPUS_DATA.find(item => item.id === location.blockId);
           if (!block) return null;
-          const stats = getBlockStats(block);
+
           const isSelected = selectedBlockId === block.id;
-          const isHovered = hoveredBlock === block.id;
-          const ml = stats.maxLevel;
-          const color = ml ? levelColor(ml) : '#22a861';
-          const hasRisks = stats.total > 0;
 
           return (
-            <g key={block.id}
-              style={{ cursor: 'pointer', outline: 'none' }}
-              transform={`translate(${marker.x} ${marker.y})`}
-              role="button"
-              tabIndex={0}
-              aria-label={`${block.name}: ${stats.total} ${stats.total === 1 ? 'risco registrado' : 'riscos registrados'}`}
-              onClick={() => onSelectBlock(block.id)}
-              onKeyDown={event => {
-                if (event.key === 'Enter' || event.key === ' ') onSelectBlock(block.id);
+            <Marker
+              key={location.id}
+              position={location.position}
+              icon={createBuildingMarkerIcon({ selected: isSelected })}
+              eventHandlers={{
+                click: () => onSelectBlock(block.id),
               }}
-              onMouseEnter={() => setHoveredBlock(block.id)}
-              onMouseLeave={() => { setHoveredBlock(null); setTooltip(null); }}
-              onMouseMove={e => handleMouseMove(e, block)}
-            >
-              <circle
-                r={isSelected ? 22 : isHovered ? 20 : 18}
-                fill="#ffffff"
-                stroke={isSelected ? '#1a5c38' : color}
-                strokeWidth={isSelected ? 5 : 4}
-                filter="drop-shadow(0 3px 5px rgba(15, 26, 20, 0.28))"
-              />
-              <circle r="12" fill={hasRisks ? color : '#22a861'} />
-              <text
-                x="0"
-                y="4"
-                textAnchor="middle"
-                fill="#ffffff"
-                fontSize="12"
-                fontWeight="800"
-                fontFamily="Inter, sans-serif"
-              >
-                {stats.total}
-              </text>
-              <title>{`${block.name} — ${stats.total} ${stats.total === 1 ? 'risco registrado' : 'riscos registrados'}`}</title>
-            </g>
+            />
           );
         })}
-      </svg>
+      </MapContainer>
 
       <div style={{
         position: 'absolute', top: 16, left: 16,
@@ -234,42 +270,6 @@ function CampusMap({
       }}>
         Campus Campina Grande · Setor CCT
       </div>
-
-      {/* Tooltip */}
-      {tooltip && (
-        <div style={{
-          position: 'absolute',
-          left: tooltip.x + 12,
-          top: tooltip.y - 60,
-          background: 'white',
-          borderRadius: 10,
-          border: '1px solid #e2e8e4',
-          boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
-          padding: '10px 14px',
-          minWidth: 180,
-          pointerEvents: 'none',
-          zIndex: 10,
-        }}>
-          {(() => {
-            const stats = getBlockStats(tooltip.block);
-            const ml = stats.maxLevel;
-            return (
-              <>
-                <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4, fontFamily: 'DM Sans, Inter, sans-serif' }}>{tooltip.block.name}</div>
-                <div style={{ fontSize: 11, color: '#6b7f74', marginBottom: 8 }}>{tooltip.block.fullName}</div>
-                {stats.total > 0 ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <RiskBadge level={ml!} />
-                    <span style={{ fontSize: 11, color: '#6b7f74' }}>{stats.total} riscos ativos</span>
-                  </div>
-                ) : (
-                  <span style={{ fontSize: 11, color: '#22a861', fontWeight: 600 }}>✓ Sem riscos ativos</span>
-                )}
-              </>
-            );
-          })()}
-        </div>
-      )}
     </div>
   );
 }
@@ -288,6 +288,7 @@ function BlockPanel({
   selectedRoomId: string | null;
 }) {
   const stats = getBlockStats(block);
+  const dominantRisk = getDominantRisk(getActiveRisksFromBlock(block));
   const [openFloors, setOpenFloors] = useState<Set<string>>(new Set(block.floors.map(f => f.id)));
 
   const toggleFloor = (id: string) => {
@@ -328,7 +329,7 @@ function BlockPanel({
         {/* Stats row */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginTop: 14 }}>
           {[
-            { label: 'Andares', value: stats.floors },
+            { label: 'Pavimentos', value: stats.floors },
             { label: 'Ambientes', value: stats.rooms },
             { label: 'Riscos ativos', value: stats.total },
           ].map(s => (
@@ -340,6 +341,109 @@ function BlockPanel({
             </div>
           ))}
         </div>
+
+        {block.description && (
+          <div style={{
+            marginTop: 12,
+            border: '1px solid #e2e8e4',
+            background: '#f9fbf9',
+            borderRadius: 8,
+            padding: '10px 12px',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{
+                  fontSize: 10,
+                  color: '#795548',
+                  fontWeight: 800,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  marginBottom: 3,
+                }}>
+                  Informações do bloco
+                </div>
+                <div style={{
+                  fontSize: 13,
+                  color: '#0f1a14',
+                  fontWeight: 800,
+                  lineHeight: 1.25,
+                  fontFamily: 'DM Sans, Inter, sans-serif',
+                }}>
+                  {block.fullName}
+                </div>
+              </div>
+              <span style={{
+                flexShrink: 0,
+                padding: '3px 7px',
+                borderRadius: 999,
+                background: '#f7f1ee',
+                color: '#795548',
+                fontSize: 10,
+                fontWeight: 800,
+                border: '1px solid #eadbd3',
+              }}>
+                {block.shortName}
+              </span>
+            </div>
+
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+              gap: 6,
+              marginTop: 9,
+            }}>
+              {[
+                { label: 'Campus', value: block.campus },
+                { label: 'Centro', value: block.center },
+                { label: 'Unidade', value: block.unit },
+                { label: 'Prédio', value: block.name },
+              ].filter((item): item is { label: string; value: string } => Boolean(item.value)).map(item => (
+                <div key={item.label} style={{
+                  minWidth: 0,
+                  background: 'white',
+                  border: '1px solid #edf1ee',
+                  borderRadius: 7,
+                  padding: '6px 7px',
+                }}>
+                  <div style={{ fontSize: 9, color: '#6b7f74', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    {item.label}
+                  </div>
+                  <div style={{
+                    marginTop: 2,
+                    fontSize: 11,
+                    color: '#0f1a14',
+                    fontWeight: 700,
+                    lineHeight: 1.25,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {item.value}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ marginTop: 9 }}>
+              <div>
+                <div style={{ fontSize: 9, color: '#6b7f74', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                  Descrição
+                </div>
+                <div style={{
+                  marginTop: 2,
+                  fontSize: 11,
+                  color: '#0f1a14',
+                  lineHeight: 1.45,
+                  maxHeight: 64,
+                  overflowY: 'auto',
+                  paddingRight: 4,
+                }}>
+                  {block.description}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Risk distribution */}
         {stats.total > 0 && (
@@ -354,6 +458,7 @@ function BlockPanel({
             {stats.low > 0 && <span style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 11, color: levelColor('baixo'), fontWeight: 600 }}>
               <span>●</span>{stats.low} baixo{stats.low > 1 ? 's' : ''}
             </span>}
+            {dominantRisk && <RiskBadge level={dominantRisk.level} category={dominantRisk.category} />}
           </div>
         )}
       </div>
@@ -395,6 +500,7 @@ function BlockPanel({
                 <div style={{ padding: '4px 12px 4px' }}>
                   {floor.rooms.map(room => {
                     const rs = getRoomStats(room);
+                    const dominantRoomRisk = getDominantRisk(room.risks.filter(r => r.status !== 'resolvido' && r.status !== 'rejeitado'));
                     const isSelected = selectedRoomId === room.id;
                     return (
                       <button
@@ -424,7 +530,7 @@ function BlockPanel({
                               <span style={{ fontSize: 12, fontWeight: 600, color: '#0f1a14' }}>
                                 {rs.total} risco{rs.total > 1 ? 's' : ''}
                               </span>
-                              <RiskBadge level={rs.maxLevel!} />
+                              <RiskBadge level={rs.maxLevel!} category={dominantRoomRisk?.category} />
                             </div>
                           )}
                         </div>
@@ -460,6 +566,7 @@ function RoomPanel({
 }) {
   const rs = getRoomStats(room);
   const activeRisks = room.risks.filter(r => r.status !== 'resolvido' && r.status !== 'rejeitado');
+  const dominantRisk = getDominantRisk(activeRisks);
 
   return (
     <div className="panel-enter" style={{
@@ -483,7 +590,7 @@ function RoomPanel({
           <div style={{ marginTop: 12, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
             <span style={{ fontSize: 12, fontWeight: 600, color: '#0f1a14' }}>{rs.total} riscos ativos</span>
             <span style={{ color: '#e2e8e4' }}>·</span>
-            {rs.maxLevel && <RiskBadge level={rs.maxLevel} size="md" />}
+            {dominantRisk && <RiskBadge level={dominantRisk.level} category={dominantRisk.category} size="md" />}
             {rs.lastUpdate && <span style={{ fontSize: 11, color: '#6b7f74', marginLeft: 4 }}>Atualizado {rs.lastUpdate}</span>}
           </div>
         ) : (
@@ -495,6 +602,118 @@ function RoomPanel({
 
       {/* Risk cards */}
       <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+        {(room.description || room.activities || room.exposureGroup) && (
+          <div style={{
+            border: '1px solid #e2e8e4',
+            background: '#f9fbf9',
+            borderRadius: 8,
+            padding: '12px 14px',
+            marginBottom: 12,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{
+                  fontSize: 10,
+                  color: '#795548',
+                  fontWeight: 800,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  marginBottom: 3,
+                }}>
+                  Informações da sala
+                </div>
+                <div style={{
+                  fontSize: 14,
+                  color: '#0f1a14',
+                  fontWeight: 800,
+                  lineHeight: 1.25,
+                  fontFamily: 'DM Sans, Inter, sans-serif',
+                }}>
+                  {room.name}
+                </div>
+              </div>
+              <span style={{
+                flexShrink: 0,
+                padding: '3px 7px',
+                borderRadius: 999,
+                background: '#f7f1ee',
+                color: '#795548',
+                fontSize: 10,
+                fontWeight: 800,
+                border: '1px solid #eadbd3',
+              }}>
+                {floorName}
+              </span>
+            </div>
+
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+              gap: 6,
+              marginTop: 10,
+            }}>
+              {[
+                { label: 'Tipo', value: roomTypeLabel(room.type) },
+                { label: 'Público', value: room.exposureGroup },
+              ].filter((item): item is { label: string; value: string } => Boolean(item.value)).map(item => (
+                <div key={item.label} style={{
+                  minWidth: 0,
+                  background: 'white',
+                  border: '1px solid #edf1ee',
+                  borderRadius: 7,
+                  padding: '6px 7px',
+                }}>
+                  <div style={{ fontSize: 9, color: '#6b7f74', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    {item.label}
+                  </div>
+                  <div style={{
+                    marginTop: 2,
+                    fontSize: 11,
+                    color: '#0f1a14',
+                    fontWeight: 700,
+                    lineHeight: 1.25,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {item.value}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {room.activities && (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontSize: 9, color: '#6b7f74', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                  Atividades
+                </div>
+                <div style={{ marginTop: 2, fontSize: 11, color: '#0f1a14', lineHeight: 1.45 }}>
+                  {room.activities}
+                </div>
+              </div>
+            )}
+
+            {room.description && (
+              <div style={{ marginTop: 9 }}>
+                <div style={{ fontSize: 9, color: '#6b7f74', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                  Descrição da sala
+                </div>
+                <div style={{
+                  marginTop: 2,
+                  fontSize: 11,
+                  color: '#0f1a14',
+                  lineHeight: 1.45,
+                  maxHeight: 72,
+                  overflowY: 'auto',
+                  paddingRight: 4,
+                }}>
+                  {room.description}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {activeRisks.length === 0 && (
           <div style={{ textAlign: 'center', padding: '40px 20px', color: '#6b7f74', fontSize: 13 }}>
             Este ambiente não possui riscos ativos registrados.
@@ -502,25 +721,26 @@ function RoomPanel({
         )}
         {activeRisks.map(risk => {
           const isSelected = selectedRiskId === risk.id;
+          const theme = riskTypeTheme(risk.category);
           return (
             <button
               key={risk.id}
               onClick={() => onSelectRisk(risk)}
               style={{
-                width: '100%', textAlign: 'left', background: isSelected ? '#f0f9f4' : 'white',
-                border: `1.5px solid ${isSelected ? '#1a5c38' : '#e2e8e4'}`,
+                width: '100%', textAlign: 'left', background: isSelected ? theme.bg : 'white',
+                border: `1.5px solid ${isSelected ? theme.color : '#e2e8e4'}`,
                 borderRadius: 10, padding: '12px 14px', marginBottom: 8,
                 cursor: 'pointer', display: 'block',
                 transition: 'all 0.15s',
               }}
-              onMouseEnter={e => { if (!isSelected) { (e.currentTarget as HTMLElement).style.borderColor = '#c5d1cc'; (e.currentTarget as HTMLElement).style.background = '#f5f6f8'; } }}
+              onMouseEnter={e => { if (!isSelected) { (e.currentTarget as HTMLElement).style.borderColor = theme.border; (e.currentTarget as HTMLElement).style.background = theme.bg; } }}
               onMouseLeave={e => { if (!isSelected) { (e.currentTarget as HTMLElement).style.borderColor = '#e2e8e4'; (e.currentTarget as HTMLElement).style.background = 'white'; } }}
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
                 <div style={{ fontSize: 13, fontWeight: 600, color: '#0f1a14', lineHeight: 1.4, flex: 1 }}>
                   {risk.title}
                 </div>
-                <RiskBadge level={risk.level} />
+                <RiskBadge level={risk.level} category={risk.category} />
               </div>
               <div style={{ marginTop: 6, fontSize: 11, color: '#6b7f74' }}>
                 {risk.category}
@@ -554,7 +774,8 @@ function RiskDrawer({
   breadcrumb: string;
   onClose: () => void;
 }) {
-  const riskColor = levelColor(risk.level);
+  const typeTheme = riskTypeTheme(risk.category);
+  const riskColor = typeTheme.color;
   const riskScore = risk.severity * risk.probability;
 
   return (
@@ -569,7 +790,7 @@ function RiskDrawer({
         background: `linear-gradient(135deg, ${riskColor}08, transparent)`,
       }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-          <RiskBadge level={risk.level} size="md" />
+          <RiskBadge level={risk.level} category={risk.category} size="md" />
           <button onClick={onClose} style={{
             border: 'none', background: '#f0f2f4', cursor: 'pointer', borderRadius: 6,
             width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -605,8 +826,8 @@ function RiskDrawer({
           {/* Risk score */}
           <div style={{
             display: 'flex', alignItems: 'center', gap: 12,
-            background: levelBg(risk.level), borderRadius: 10, padding: '12px 14px',
-            border: `1px solid ${riskColor}22`,
+            background: typeTheme.bg, borderRadius: 10, padding: '12px 14px',
+            border: `1px solid ${typeTheme.border}`,
           }}>
             <div style={{ textAlign: 'center' }}>
               <div style={{ fontSize: 28, fontWeight: 800, color: riskColor, fontFamily: 'DM Sans, Inter, sans-serif', lineHeight: 1 }}>
@@ -616,9 +837,9 @@ function RiskDrawer({
             </div>
             <div>
               <div style={{ fontSize: 12, fontWeight: 700, color: riskColor }}>
-                {levelIcon(risk.level)} {levelLabel(risk.level).toUpperCase()}
+                {typeTheme.icon} {typeTheme.label.toUpperCase()} · {levelLabel(risk.level).toUpperCase()}
               </div>
-              <div style={{ fontSize: 11, color: '#6b7f74', marginTop: 2 }}>Nível de risco calculado</div>
+              <div style={{ fontSize: 11, color: '#6b7f74', marginTop: 2 }}>Tipo ocupacional e nível calculado</div>
             </div>
           </div>
         </div>
@@ -872,24 +1093,25 @@ function EngineerDashboard() {
               <div style={{ flex: 1, overflowY: 'auto' }}>
                 {filteredRisks.map(risk => {
                   const isSelected = selectedReport?.id === risk.id;
+                  const theme = riskTypeTheme(risk.category);
                   return (
                     <button
                       key={risk.id}
                       onClick={() => setSelectedReport(risk)}
                       style={{
                         width: '100%', textAlign: 'left', padding: '11px 14px',
-                        background: isSelected ? '#e8f5ee' : 'white',
+                        background: isSelected ? theme.bg : 'white',
                         border: 'none', borderBottom: '1px solid #f0f2f4',
                         cursor: 'pointer', display: 'block',
-                        borderLeft: isSelected ? '3px solid #1a5c38' : '3px solid transparent',
+                        borderLeft: isSelected ? `3px solid ${theme.color}` : '3px solid transparent',
                         transition: 'all 0.1s',
                       }}
-                      onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = '#f9fbf9'; }}
+                      onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = theme.bg; }}
                       onMouseLeave={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'white'; }}
                     >
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6 }}>
                         <div style={{ fontSize: 12, fontWeight: 600, color: '#0f1a14', lineHeight: 1.4, flex: 1 }}>{risk.title}</div>
-                        <RiskBadge level={risk.level} />
+                        <RiskBadge level={risk.level} category={risk.category} />
                       </div>
                       <div style={{ fontSize: 10, color: '#6b7f74', marginTop: 3 }}>{risk.category}</div>
                       <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -909,7 +1131,7 @@ function EngineerDashboard() {
                 border: '1px solid #e2e8e4', overflow: 'hidden', display: 'flex', flexDirection: 'column',
               }}>
                 {/* Panel header */}
-                <div style={{ padding: '14px 20px', borderBottom: '1px solid #e2e8e4', background: `${levelColor(selectedReport.level)}06` }}>
+                <div style={{ padding: '14px 20px', borderBottom: '1px solid #e2e8e4', background: riskTypeTheme(selectedReport.category).bg }}>
                   <div style={{ fontSize: 10, fontWeight: 600, color: '#6b7f74', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
                     Analisar relato
                   </div>
@@ -920,7 +1142,7 @@ function EngineerDashboard() {
                       </div>
                       <div style={{ fontSize: 11, color: '#6b7f74', marginTop: 3 }}>{selectedReport.category}</div>
                     </div>
-                    <RiskBadge level={selectedReport.level} size="md" />
+                    <RiskBadge level={selectedReport.level} category={selectedReport.category} size="md" />
                   </div>
                 </div>
 
@@ -949,23 +1171,23 @@ function EngineerDashboard() {
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 16 }}>
                     <div style={{ background: '#f5f6f8', borderRadius: 8, padding: '10px 12px' }}>
                       <div style={{ fontSize: 10, color: '#6b7f74', marginBottom: 4 }}>Severidade</div>
-                      <ScoreBar value={selectedReport.severity} color={levelColor(selectedReport.level)} />
+                      <ScoreBar value={selectedReport.severity} color={riskTypeTheme(selectedReport.category).color} />
                       <div style={{ fontSize: 14, fontWeight: 700, color: '#0f1a14', marginTop: 4 }}>{selectedReport.severity}/5</div>
                     </div>
                     <div style={{ background: '#f5f6f8', borderRadius: 8, padding: '10px 12px' }}>
                       <div style={{ fontSize: 10, color: '#6b7f74', marginBottom: 4 }}>Probabilidade</div>
-                      <ScoreBar value={selectedReport.probability} color={levelColor(selectedReport.level)} />
+                      <ScoreBar value={selectedReport.probability} color={riskTypeTheme(selectedReport.category).color} />
                       <div style={{ fontSize: 14, fontWeight: 700, color: '#0f1a14', marginTop: 4 }}>{selectedReport.probability}/5</div>
                     </div>
                     <div style={{
-                      background: levelBg(selectedReport.level), borderRadius: 8, padding: '10px 12px',
-                      border: `1px solid ${levelColor(selectedReport.level)}22`, textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                      background: riskTypeTheme(selectedReport.category).bg, borderRadius: 8, padding: '10px 12px',
+                      border: `1px solid ${riskTypeTheme(selectedReport.category).border}`, textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
                     }}>
-                      <div style={{ fontSize: 26, fontWeight: 800, color: levelColor(selectedReport.level), fontFamily: 'DM Sans, Inter, sans-serif', lineHeight: 1 }}>
+                      <div style={{ fontSize: 26, fontWeight: 800, color: riskTypeTheme(selectedReport.category).color, fontFamily: 'DM Sans, Inter, sans-serif', lineHeight: 1 }}>
                         {selectedReport.riskScore}
                       </div>
                       <div style={{ fontSize: 9, color: '#6b7f74', marginTop: 1 }}>R = S × P</div>
-                      <RiskBadge level={selectedReport.level} />
+                      <RiskBadge level={selectedReport.level} category={selectedReport.category} />
                     </div>
                   </div>
 
@@ -1029,23 +1251,26 @@ function EngineerDashboard() {
 // ─── Legend ───────────────────────────────────────────────────────────────────
 
 function MapLegend() {
-  const levels: RiskLevel[] = ['critico', 'alto', 'moderado', 'baixo'];
+  const types: RiskTypeKey[] = ['fisico', 'quimico', 'biologico', 'ergonomico', 'acidente'];
   return (
-    <div style={{
+    <div className="map-risk-legend" style={{
       position: 'absolute', bottom: 20, left: 20,
       background: 'white', borderRadius: 10, padding: '10px 14px',
       border: '1px solid #e2e8e4', boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
-      zIndex: 5,
+      zIndex: 800, pointerEvents: 'none',
     }}>
       <div style={{ fontSize: 10, fontWeight: 600, color: '#6b7f74', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>
-        Nível de risco
+        Tipo de risco
       </div>
-      {levels.map(level => (
-        <div key={level} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-          <span style={{ color: levelColor(level), fontSize: 10 }}>{levelIcon(level)}</span>
-          <span style={{ fontSize: 11, color: '#0f1a14', fontWeight: 500 }}>{levelLabel(level)}</span>
+      {types.map(type => {
+        const theme = RISK_TYPE_THEME[type];
+        return (
+        <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+          <span style={{ color: theme.color, fontSize: 10 }}>{theme.icon}</span>
+          <span style={{ fontSize: 11, color: '#0f1a14', fontWeight: 500 }}>{theme.label}</span>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

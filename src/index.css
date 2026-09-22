@@ -114,3 +114,59 @@ body {
   border-radius: 2px;
   display: inline-block;
 }
+
+.leaflet-container {
+  font-family: var(--font-sans);
+}
+
+.risk-leaflet-marker {
+  background: transparent;
+  border: 0;
+}
+
+.risk-leaflet-marker__pin {
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform: translateZ(0);
+}
+
+.risk-leaflet-marker__pin span {
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.building-leaflet-marker {
+  background: transparent;
+  border: 0;
+}
+
+.building-leaflet-marker__button {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.block-map-label {
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #d8e1dc;
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(15, 26, 20, 0.16);
+  color: #0f1a14;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+  padding: 3px 7px;
+  pointer-events: none;
+}
+
+.block-map-label::before {
+  display: none;
+}
+
+.leaflet-interactive {
+  cursor: pointer;
+}
