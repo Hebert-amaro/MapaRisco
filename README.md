@@ -25,10 +25,10 @@ Abra o PowerShell e instale o pnpm:
 npm install --global pnpm
 ```
 
-Feche e abra o PowerShell novamente. Em seguida, entre na pasta do projeto:
+Feche e abra o PowerShell novamente. Em seguida, entre na pasta em que o repositório foi clonado:
 
 ```powershell
-cd D:\UFCG\MapaRiscoSiais\MapaRisco
+cd C:\caminho\para\MapaRisco
 ```
 
 Instale as dependências e inicie o servidor:
