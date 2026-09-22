@@ -1,0 +1,116 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
+@import 'tailwindcss';
+
+@theme inline {
+  --color-background: #f5f6f8;
+  --color-foreground: #0f1a14;
+  --color-card: #ffffff;
+  --color-card-foreground: #0f1a14;
+  --color-primary: #1a5c38;
+  --color-primary-dark: #0f3824;
+  --color-primary-light: #e8f5ee;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #f0f4f1;
+  --color-secondary-foreground: #2d4a38;
+  --color-muted: #f0f2f4;
+  --color-muted-foreground: #6b7f74;
+  --color-accent: #2a7a4b;
+  --color-border: #e2e8e4;
+  --color-ring: #1a5c38;
+
+  --color-risk-low: #22a861;
+  --color-risk-low-bg: #edfaf3;
+  --color-risk-moderate: #d98a00;
+  --color-risk-moderate-bg: #fff8e6;
+  --color-risk-high: #d05a10;
+  --color-risk-high-bg: #fff1e8;
+  --color-risk-critical: #c0280e;
+  --color-risk-critical-bg: #fff0ee;
+
+  --color-status-pending: #8b6b00;
+  --color-status-pending-bg: #fffbe6;
+  --color-status-evaluating: #1a5c8c;
+  --color-status-evaluating-bg: #e8f2fb;
+  --color-status-validated: #1a5c38;
+  --color-status-validated-bg: #edfaf3;
+  --color-status-resolved: #4b5563;
+  --color-status-resolved-bg: #f3f4f6;
+
+  --radius: 10px;
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-display: 'DM Sans', system-ui, sans-serif;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #c5d1cc;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a0b0a8;
+}
+
+/* Map grid background */
+.map-grid {
+  background-color: #e8eef0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.6) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.6) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* Dot pattern for panels */
+.dot-pattern {
+  background-image: radial-gradient(circle, #d1ddd7 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* Transitions */
+.panel-enter {
+  animation: slideIn 0.25s ease-out;
+}
+
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.drawer-enter {
+  animation: drawerIn 0.25s ease-out;
+}
+
+@keyframes drawerIn {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+/* Risk level indicator line */
+.risk-bar-segment {
+  height: 4px;
+  border-radius: 2px;
+  display: inline-block;
+}
