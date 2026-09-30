@@ -139,15 +139,67 @@ body {
   line-height: 1;
 }
 
-.building-leaflet-marker {
+.risk-summary-marker {
   background: transparent;
   border: 0;
 }
 
-.building-leaflet-marker__button {
-  background: transparent;
-  border: 0;
+.risk-summary-marker__wrap {
+  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.risk-summary-marker__main {
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.92);
+  border-radius: 999px;
+  color: #ffffff;
   cursor: pointer;
+  display: flex;
+  font-size: 10px;
+  font-weight: 800;
+  justify-content: center;
+  line-height: 1;
+}
+
+.risk-summary-marker__dropdown {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid #e2e8e4;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(15, 26, 20, 0.16);
+  display: flex;
+  gap: 5px;
+  padding: 5px 6px;
+  white-space: nowrap;
+}
+
+.risk-summary-marker__item {
+  align-items: center;
+  display: inline-flex;
+  gap: 3px;
+}
+
+.risk-summary-marker__mini-dot {
+  align-items: center;
+  border-radius: 999px;
+  color: #ffffff;
+  display: inline-flex;
+  font-size: 6px;
+  font-weight: 900;
+  height: 9px;
+  justify-content: center;
+  line-height: 1;
+  width: 9px;
+}
+
+.risk-summary-marker__count {
+  color: #0f1a14;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1;
 }
 
 .block-map-label {
@@ -168,5 +220,9 @@ body {
 }
 
 .leaflet-interactive {
+  cursor: auto;
+}
+
+.campus-block-perimeter {
   cursor: pointer;
 }

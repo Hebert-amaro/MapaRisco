@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import L from 'leaflet';
-import { MapContainer, Marker, TileLayer } from 'react-leaflet';
+import { GeoJSON, MapContainer, Marker, TileLayer, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import { CAMPUS_DATA, getBlockStats, getRoomStats, type Block, type Room, type Risk, type RiskLevel, type RiskStatus, ALL_RISKS } from './data';
 
@@ -68,10 +68,24 @@ function riskTypeTheme(category: string) {
   return RISK_TYPE_THEME[riskTypeFromCategory(category)];
 }
 
+function riskLevelWeight(level: RiskLevel) {
+  switch (level) {
+    case 'critico': return 4;
+    case 'alto': return 3;
+    case 'moderado': return 2;
+    case 'baixo': return 1;
+  }
+}
+
 function getActiveRisksFromBlock(block: Block) {
   return block.floors
     .flatMap(floor => floor.rooms.flatMap(room => room.risks))
     .filter(risk => risk.status !== 'resolvido' && risk.status !== 'rejeitado');
+}
+
+function filterRisksByType(risks: Risk[], type: RiskTypeKey | null) {
+  if (!type) return risks;
+  return risks.filter(risk => riskTypeFromCategory(risk.category) === type);
 }
 
 function getDominantRisk(risks: Risk[]) {
@@ -131,6 +145,8 @@ function RiskBadge({ level, category, size = 'sm' }: { level: RiskLevel; categor
 }
 
 function StatusBadge({ status }: { status: RiskStatus }) {
+  if (status === 'pendente') return null;
+
   const c = statusColor(status);
   return (
     <span style={{
@@ -187,43 +203,357 @@ const MAP_MIN_ZOOM = 15;
 const MAP_INITIAL_ZOOM = 17;
 const MAP_MAX_ZOOM = 19;
 
-const LOCATION_MARKERS = [
-  {
-    id: 'cw2-lab-quimica-analitica',
-    blockId: 'cw2',
-    position: [-7.21297969766558, -35.90613289321617],
-  },
-] as const satisfies readonly {
+type CampusMapFeature = {
+  type: 'Feature';
+  properties: {
+    kind?: string;
+    osmId?: string;
+    name?: string;
+    building?: string;
+    highway?: string;
+    landuse?: string;
+    leisure?: string;
+    natural?: string;
+  };
+  geometry: {
+    type: 'Polygon' | 'LineString';
+    coordinates: unknown;
+  };
+};
+
+type CampusMapGeoJSON = {
+  type: 'FeatureCollection';
+  bounds?: {
+    minlat: number;
+    minlon: number;
+    maxlat: number;
+    maxlon: number;
+  };
+  features: CampusMapFeature[];
+};
+
+type MapNamedPlace = {
+  id: string;
+  name: string;
+  kind?: string;
+  position: [number, number];
+  blockId?: string;
+};
+
+type LocationMarker = {
   id: string;
   blockId: string;
   position: [number, number];
-}[];
+};
 
-function createBuildingMarkerIcon({ selected }: { selected: boolean }) {
-  const width = selected ? 86 : 76;
-  const height = selected ? 64 : 56;
+type MapFocusTarget = {
+  id: string;
+  position: [number, number];
+  zoom?: number;
+};
+
+function getBlockCoordinate(block: Block): [number, number] | null {
+  if (block.coordinates) return block.coordinates;
+
+  for (const floor of block.floors) {
+    const room = floor.rooms.find(item => item.coordinates);
+    if (room?.coordinates) return room.coordinates;
+  }
+
+  return null;
+}
+
+function getRoomCoordinate(room: Room, block: Block): [number, number] | null {
+  return room.coordinates ?? getBlockCoordinate(block);
+}
+
+function collectGeoJsonPoints(coordinates: unknown): [number, number][] {
+  if (!Array.isArray(coordinates)) return [];
+
+  if (
+    coordinates.length >= 2
+    && typeof coordinates[0] === 'number'
+    && typeof coordinates[1] === 'number'
+  ) {
+    return [[coordinates[0], coordinates[1]]];
+  }
+
+  return coordinates.flatMap(collectGeoJsonPoints);
+}
+
+function getFeatureCenter(feature: CampusMapFeature): [number, number] | null {
+  const points = collectGeoJsonPoints(feature.geometry.coordinates);
+  if (points.length === 0) return null;
+
+  const [lonSum, latSum] = points.reduce(
+    ([lonTotal, latTotal], [lon, lat]) => [lonTotal + lon, latTotal + lat],
+    [0, 0],
+  );
+
+  return [latSum / points.length, lonSum / points.length];
+}
+
+function getFeatureBadgePosition(feature: CampusMapFeature): [number, number] | null {
+  const points = collectGeoJsonPoints(feature.geometry.coordinates);
+  if (points.length === 0) return null;
+
+  const lats = points.map(([, lat]) => lat);
+  const lons = points.map(([lon]) => lon);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  const latSpan = Math.max(maxLat - minLat, 0.00004);
+  const lonSpan = Math.max(maxLon - minLon, 0.00004);
+
+  return [
+    maxLat - latSpan * 0.22,
+    maxLon - lonSpan * 0.18,
+  ];
+}
+
+function normalizeMapName(value: string) {
+  return normalizeText(value)
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function mapFeatureMatchesBlock(featureName: string | undefined, block: Block) {
+  if (!featureName) return false;
+
+  const feature = normalizeMapName(featureName);
+  const blockName = normalizeMapName(block.name);
+  const shortName = normalizeMapName(block.shortName);
+
+  return (
+    feature === blockName
+    || feature.includes(blockName)
+    || feature.includes(`bloco ${shortName}`)
+  );
+}
+
+function getBlockForMapFeature(feature: CampusMapFeature) {
+  if (feature.properties.kind !== 'building') return null;
+  return CAMPUS_DATA.find(block => mapFeatureMatchesBlock(feature.properties.name, block)) ?? null;
+}
+
+function getMapFeatureForBlock(block: Block, campusGeoJson: CampusMapGeoJSON | null) {
+  return campusGeoJson?.features.find(feature => getBlockForMapFeature(feature)?.id === block.id) ?? null;
+}
+
+function getBlockMapPosition(block: Block, campusGeoJson: CampusMapGeoJSON | null): [number, number] | null {
+  const feature = getMapFeatureForBlock(block, campusGeoJson);
+  return feature ? getFeatureCenter(feature) : getBlockCoordinate(block);
+}
+
+function getBlockRiskIndicatorPosition(block: Block, campusGeoJson: CampusMapGeoJSON | null): [number, number] | null {
+  const feature = getMapFeatureForBlock(block, campusGeoJson);
+  const badgePosition = feature ? getFeatureBadgePosition(feature) : null;
+  if (badgePosition) return badgePosition;
+
+  const coordinate = getBlockCoordinate(block);
+  return coordinate ? [coordinate[0] + 0.00008, coordinate[1] + 0.00008] : null;
+}
+
+function getLocationMarkers(campusGeoJson: CampusMapGeoJSON | null): LocationMarker[] {
+  return CAMPUS_DATA.flatMap(block => {
+    const position = getBlockRiskIndicatorPosition(block, campusGeoJson);
+    if (!position) return [];
+
+    return [{
+      id: `${block.id}-location`,
+      blockId: block.id,
+      position,
+    }];
+  });
+}
+
+type RiskTypeSummary = {
+  type: RiskTypeKey;
+  count: number;
+  maxLevel: RiskLevel;
+};
+
+function getRiskTypeSummaries(risks: Risk[]): RiskTypeSummary[] {
+  const summaries = new Map<RiskTypeKey, RiskTypeSummary>();
+
+  risks.forEach(risk => {
+    const type = riskTypeFromCategory(risk.category);
+    const current = summaries.get(type);
+
+    if (!current) {
+      summaries.set(type, { type, count: 1, maxLevel: risk.level });
+      return;
+    }
+
+    current.count += 1;
+    if (riskLevelWeight(risk.level) > riskLevelWeight(current.maxLevel)) {
+      current.maxLevel = risk.level;
+    }
+  });
+
+  return [...summaries.values()].sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    return riskLevelWeight(b.maxLevel) - riskLevelWeight(a.maxLevel);
+  });
+}
+
+function createRiskSummaryIcon({
+  summaries,
+  expanded,
+  selected,
+}: {
+  summaries: RiskTypeSummary[];
+  expanded: boolean;
+  selected: boolean;
+}) {
+  const dominant = summaries[0];
+  const dominantTheme = RISK_TYPE_THEME[dominant.type];
+  const size = selected || expanded ? 20 : 17;
+  const width = expanded ? 132 : size;
+  const height = expanded ? 62 : size;
+  const itemsHtml = summaries.map(summary => {
+    const theme = RISK_TYPE_THEME[summary.type];
+    return `
+      <span class="risk-summary-marker__item" title="${theme.label}: ${summary.count}">
+        <span class="risk-summary-marker__mini-dot" style="background:${theme.color}">${theme.icon}</span>
+        <span class="risk-summary-marker__count">${summary.count}</span>
+      </span>
+    `;
+  }).join('');
 
   return L.divIcon({
-    className: 'building-leaflet-marker',
+    className: 'risk-summary-marker',
     html: `
-      <div class="building-leaflet-marker__button" style="
-        width:${width}px;
-        height:${height}px;
-      "></div>
+      <div class="risk-summary-marker__wrap ${expanded ? 'is-expanded' : ''}">
+        <div class="risk-summary-marker__main" style="width:${size}px;height:${size}px;background:${dominantTheme.color};box-shadow:0 0 0 3px ${dominantTheme.bg},0 2px 8px rgba(15,26,20,0.22)">
+          <span>${dominantTheme.icon}</span>
+        </div>
+        ${expanded ? `<div class="risk-summary-marker__dropdown">${itemsHtml}</div>` : ''}
+      </div>
     `,
     iconSize: [width, height],
-    iconAnchor: [width / 2, height / 2],
-    popupAnchor: [0, -height / 2],
+    iconAnchor: [width / 2, expanded ? 10 : size / 2],
   });
+}
+
+function CampusOsmOverlay({
+  campusGeoJson,
+  selectedBlockId,
+  onSelectBlock,
+}: {
+  campusGeoJson: CampusMapGeoJSON | null;
+  selectedBlockId: string | null;
+  onSelectBlock: (id: string) => void;
+}) {
+  if (!campusGeoJson) return null;
+
+  return (
+    <GeoJSON
+      data={campusGeoJson}
+      interactive
+      onEachFeature={(feature, layer) => {
+        const block = getBlockForMapFeature(feature as CampusMapFeature);
+        if (!block) return;
+
+        layer.on({
+          click: () => onSelectBlock(block.id),
+        });
+      }}
+      style={feature => {
+        const properties = feature?.properties as CampusMapFeature['properties'] | undefined;
+        const block = feature ? getBlockForMapFeature(feature as CampusMapFeature) : null;
+        const isSelected = block?.id === selectedBlockId;
+
+        if (properties?.kind === 'building') {
+          if (block) {
+            return {
+              className: 'campus-block-perimeter',
+              color: isSelected ? '#1a5c38' : '#795548',
+              fillColor: isSelected ? '#e8f5ee' : '#d5cbc3',
+              fillOpacity: isSelected ? 0.62 : 0.5,
+              opacity: 0.9,
+              weight: isSelected ? 2.2 : 1.5,
+            };
+          }
+
+          return {
+            color: '#9c8f86',
+            fillColor: '#d5cbc3',
+            fillOpacity: 0.42,
+            opacity: 0.58,
+            weight: 1,
+          };
+        }
+        if (properties?.kind === 'path') {
+          return {
+            color: properties.highway === 'footway' || properties.highway === 'path' ? '#b97963' : '#9a9a9a',
+            opacity: properties.highway === 'footway' || properties.highway === 'path' ? 0.4 : 0.2,
+            weight: properties.highway === 'footway' || properties.highway === 'path' ? 1.2 : 1,
+            dashArray: properties.highway === 'footway' || properties.highway === 'path' ? '4 5' : undefined,
+          };
+        }
+        return {
+          color: '#9dbf98',
+          fillColor: '#b9d8b2',
+          fillOpacity: 0.12,
+          opacity: 0.16,
+          weight: 1,
+        };
+      }}
+    />
+  );
+}
+
+function MapFocus({ target }: { target: MapFocusTarget | null }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!target) return;
+
+    map.flyTo(target.position, target.zoom ?? MAP_MAX_ZOOM, {
+      animate: true,
+      duration: 0.8,
+    });
+  }, [map, target]);
+
+  return null;
 }
 
 function CampusMap({
   selectedBlockId,
   onSelectBlock,
+  focusTarget,
+  selectedRiskType,
 }: {
   selectedBlockId: string | null;
   onSelectBlock: (id: string) => void;
+  focusTarget: MapFocusTarget | null;
+  selectedRiskType: RiskTypeKey | null;
 }) {
+  const [expandedRiskBlockId, setExpandedRiskBlockId] = useState<string | null>(null);
+  const [campusGeoJson, setCampusGeoJson] = useState<CampusMapGeoJSON | null>(null);
+  const locationMarkers = getLocationMarkers(campusGeoJson);
+
+  useEffect(() => {
+    let active = true;
+
+    fetch(`${import.meta.env.BASE_URL}maps/campus.geojson`)
+      .then(response => response.ok ? response.json() : null)
+      .then((data: CampusMapGeoJSON | null) => {
+        if (active) setCampusGeoJson(data);
+      })
+      .catch(() => {
+        if (active) setCampusGeoJson(null);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       <MapContainer
@@ -242,20 +572,39 @@ function CampusMap({
           noWrap
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
+        <CampusOsmOverlay
+          campusGeoJson={campusGeoJson}
+          selectedBlockId={selectedBlockId}
+          onSelectBlock={onSelectBlock}
+        />
+        <MapFocus target={focusTarget} />
 
-        {LOCATION_MARKERS.map(location => {
+        {locationMarkers.map(location => {
           const block = CAMPUS_DATA.find(item => item.id === location.blockId);
           if (!block) return null;
 
+          const risks = filterRisksByType(getActiveRisksFromBlock(block), selectedRiskType);
+          const summaries = getRiskTypeSummaries(risks);
+          if (summaries.length === 0) return null;
+
+          const isExpanded = expandedRiskBlockId === block.id;
           const isSelected = selectedBlockId === block.id;
 
           return (
             <Marker
-              key={location.id}
+              key={`${location.id}-risk-summary`}
               position={location.position}
-              icon={createBuildingMarkerIcon({ selected: isSelected })}
+              icon={createRiskSummaryIcon({
+                summaries,
+                expanded: isExpanded,
+                selected: isSelected,
+              })}
+              zIndexOffset={900}
               eventHandlers={{
-                click: () => onSelectBlock(block.id),
+                click: event => {
+                  L.DomEvent.stopPropagation(event);
+                  setExpandedRiskBlockId(current => current === block.id ? null : block.id);
+                },
               }}
             />
           );
@@ -281,11 +630,15 @@ function BlockPanel({
   onClose,
   onSelectRoom,
   selectedRoomId,
+  compact = false,
+  narrow = false,
 }: {
   block: Block;
   onClose: () => void;
   onSelectRoom: (room: Room, floorName: string) => void;
   selectedRoomId: string | null;
+  compact?: boolean;
+  narrow?: boolean;
 }) {
   const stats = getBlockStats(block);
   const dominantRisk = getDominantRisk(getActiveRisksFromBlock(block));
@@ -301,13 +654,18 @@ function BlockPanel({
 
   return (
     <div className="panel-enter" style={{
-      width: 360,
-      height: '100%',
+      width: compact ? '100%' : narrow ? 320 : 360,
+      height: compact ? '44vh' : '100%',
+      maxHeight: compact ? '52vh' : undefined,
+      minHeight: compact ? 260 : undefined,
       background: 'white',
-      borderLeft: '1px solid #e2e8e4',
+      borderRight: compact ? 'none' : '1px solid #e2e8e4',
+      borderTop: compact ? '1px solid #e2e8e4' : 'none',
       display: 'flex',
       flexDirection: 'column',
       flexShrink: 0,
+      boxShadow: compact ? '0 -8px 24px rgba(15,26,20,0.12)' : undefined,
+      zIndex: compact ? 10 : undefined,
     }}>
       {/* Header */}
       <div style={{ padding: '20px 20px 0', borderBottom: '1px solid #e2e8e4', paddingBottom: 16 }}>
@@ -554,15 +912,21 @@ function RoomPanel({
   floorName,
   block,
   onBack,
+  onClose,
   onSelectRisk,
   selectedRiskId,
+  compact = false,
+  narrow = false,
 }: {
   room: Room;
   floorName: string;
   block: Block;
   onBack: () => void;
+  onClose: () => void;
   onSelectRisk: (risk: Risk) => void;
   selectedRiskId: string | null;
+  compact?: boolean;
+  narrow?: boolean;
 }) {
   const rs = getRoomStats(room);
   const activeRisks = room.risks.filter(r => r.status !== 'resolvido' && r.status !== 'rejeitado');
@@ -570,17 +934,75 @@ function RoomPanel({
 
   return (
     <div className="panel-enter" style={{
-      width: 400, height: '100%', background: 'white',
-      borderLeft: '1px solid #e2e8e4', display: 'flex', flexDirection: 'column', flexShrink: 0,
+      width: compact ? '100%' : narrow ? 340 : 400,
+      height: compact ? '45vh' : '100%',
+      maxHeight: compact ? '54vh' : undefined,
+      minHeight: compact ? 280 : undefined,
+      background: 'white',
+      borderRight: compact ? 'none' : '1px solid #e2e8e4',
+      borderTop: compact ? '1px solid #e2e8e4' : 'none',
+      display: 'flex', flexDirection: 'column', flexShrink: 0,
+      boxShadow: compact ? '0 -8px 24px rgba(15,26,20,0.12)' : undefined,
+      zIndex: compact ? 10 : undefined,
     }}>
       {/* Header */}
       <div style={{ padding: '20px 20px 16px', borderBottom: '1px solid #e2e8e4' }}>
-        <Breadcrumb parts={[
-          { label: 'Campus', onClick: onBack },
-          { label: block.shortName, onClick: onBack },
-          { label: floorName, onClick: onBack },
-          { label: room.code },
-        ]} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button
+            onClick={onBack}
+            aria-label="Voltar para o bloco"
+            title="Voltar para o bloco"
+            style={{
+              width: 30,
+              height: 30,
+              borderRadius: 7,
+              border: '1px solid #e2e8e4',
+              background: 'white',
+              color: '#1a5c38',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: 16,
+              fontWeight: 800,
+              flexShrink: 0,
+            }}
+            onMouseEnter={e => (e.currentTarget.style.background = '#e8f5ee')}
+            onMouseLeave={e => (e.currentTarget.style.background = 'white')}
+          >
+            ←
+          </button>
+          <Breadcrumb parts={[
+            { label: 'Campus', onClick: onBack },
+            { label: block.shortName, onClick: onBack },
+            { label: floorName, onClick: onBack },
+            { label: room.code },
+          ]} />
+          <button
+            onClick={onClose}
+            aria-label="Fechar aba"
+            title="Fechar aba"
+            style={{
+              marginLeft: 'auto',
+              width: 30,
+              height: 30,
+              borderRadius: 7,
+              border: 'none',
+              background: '#f0f2f4',
+              color: '#6b7f74',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: 16,
+              flexShrink: 0,
+            }}
+            onMouseEnter={e => (e.currentTarget.style.background = '#e2e8e4')}
+            onMouseLeave={e => (e.currentTarget.style.background = '#f0f2f4')}
+          >
+            ×
+          </button>
+        </div>
         <div style={{ marginTop: 12 }}>
           <div style={{ fontSize: 22, fontWeight: 700, fontFamily: 'DM Sans, Inter, sans-serif' }}>{room.code}</div>
           <div style={{ fontSize: 12, color: '#6b7f74', marginTop: 2 }}>{roomTypeLabel(room.type)}</div>
@@ -769,10 +1191,14 @@ function RiskDrawer({
   risk,
   breadcrumb,
   onClose,
+  compact = false,
+  narrow = false,
 }: {
   risk: Risk;
   breadcrumb: string;
   onClose: () => void;
+  compact?: boolean;
+  narrow?: boolean;
 }) {
   const typeTheme = riskTypeTheme(risk.category);
   const riskColor = typeTheme.color;
@@ -780,9 +1206,16 @@ function RiskDrawer({
 
   return (
     <div className="drawer-enter" style={{
-      width: 380, height: '100%', background: 'white',
-      borderLeft: '1px solid #e2e8e4', display: 'flex', flexDirection: 'column', flexShrink: 0,
-      zIndex: 5,
+      width: compact ? '100%' : narrow ? 330 : 380,
+      height: compact ? '42vh' : '100%',
+      maxHeight: compact ? '50vh' : undefined,
+      minHeight: compact ? 260 : undefined,
+      background: 'white',
+      borderRight: compact ? 'none' : '1px solid #e2e8e4',
+      borderTop: compact ? '1px solid #e2e8e4' : 'none',
+      display: 'flex', flexDirection: 'column', flexShrink: 0,
+      boxShadow: compact ? '0 -8px 24px rgba(15,26,20,0.12)' : undefined,
+      zIndex: compact ? 12 : 5,
     }}>
       {/* Header */}
       <div style={{
@@ -911,7 +1344,7 @@ const ENGINEER_RISKS = ALL_RISKS.slice(0, 8);
 const ENGINEER_RISK_FULL = ALL_RISKS.find(r => r.id === 'r011')!;
 const DASH_BLOCKS = ['Todos', 'CAA', 'CCT', 'CEEI', 'BCx', 'RU'];
 const DASH_LEVELS = ['Todos', 'Crítico', 'Alto', 'Moderado', 'Baixo'];
-const DASH_STATUS = ['Todos', 'Pendente', 'Em avaliação', 'Validado', 'Resolvido'];
+const DASH_STATUS = ['Todos', 'Em avaliação', 'Validado', 'Resolvido'];
 
 function EngineerDashboard() {
   const [activeNav, setActiveNav] = useState('relatos');
@@ -1250,25 +1683,76 @@ function EngineerDashboard() {
 
 // ─── Legend ───────────────────────────────────────────────────────────────────
 
-function MapLegend() {
+function MapLegend({
+  compact = false,
+  selectedType,
+  onSelectType,
+}: {
+  compact?: boolean;
+  selectedType: RiskTypeKey | null;
+  onSelectType: (type: RiskTypeKey | null) => void;
+}) {
   const types: RiskTypeKey[] = ['fisico', 'quimico', 'biologico', 'ergonomico', 'acidente'];
   return (
     <div className="map-risk-legend" style={{
-      position: 'absolute', bottom: 20, left: 20,
-      background: 'white', borderRadius: 10, padding: '10px 14px',
+      position: 'absolute',
+      bottom: compact ? 12 : 20,
+      right: compact ? 12 : 20,
+      background: 'white', borderRadius: 10, padding: compact ? '8px 10px' : '10px 14px',
       border: '1px solid #e2e8e4', boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
-      zIndex: 800, pointerEvents: 'none',
+      zIndex: 800,
+      maxWidth: compact ? 148 : undefined,
     }}>
-      <div style={{ fontSize: 10, fontWeight: 600, color: '#6b7f74', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>
-        Tipo de risco
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: compact ? 6 : 8 }}>
+        <div style={{ fontSize: 10, fontWeight: 600, color: '#6b7f74', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+          Tipo de risco
+        </div>
+        {selectedType && (
+          <button
+            onClick={() => onSelectType(null)}
+            title="Limpar filtro"
+            style={{
+              border: 'none',
+              background: '#f0f2f4',
+              color: '#6b7f74',
+              borderRadius: 5,
+              cursor: 'pointer',
+              fontSize: 11,
+              height: 20,
+              lineHeight: '20px',
+              padding: '0 6px',
+            }}
+          >
+            ×
+          </button>
+        )}
       </div>
       {types.map(type => {
         const theme = RISK_TYPE_THEME[type];
+        const isActive = selectedType === type;
+        const isDimmed = Boolean(selectedType && !isActive);
         return (
-        <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+        <button
+          key={type}
+          onClick={() => onSelectType(isActive ? null : type)}
+          style={{
+            width: '100%',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            marginBottom: compact ? 3 : 4,
+            border: `1px solid ${isActive ? theme.border : 'transparent'}`,
+            borderRadius: 6,
+            background: isActive ? theme.bg : 'transparent',
+            cursor: 'pointer',
+            opacity: isDimmed ? 0.42 : 1,
+            padding: compact ? '3px 4px' : '4px 5px',
+            textAlign: 'left',
+          }}
+        >
           <span style={{ color: theme.color, fontSize: 10 }}>{theme.icon}</span>
-          <span style={{ fontSize: 11, color: '#0f1a14', fontWeight: 500 }}>{theme.label}</span>
-        </div>
+          <span style={{ fontSize: compact ? 10 : 11, color: '#0f1a14', fontWeight: isActive ? 800 : 500 }}>{theme.label}</span>
+        </button>
         );
       })}
     </div>
@@ -1279,12 +1763,127 @@ function MapLegend() {
 
 type AppView = 'campus' | 'engineer';
 
+function useViewportFlags() {
+  const [width, setWidth] = useState(() => window.innerWidth);
+
+  useEffect(() => {
+    const handleResize = () => setWidth(window.innerWidth);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  return {
+    width,
+    isMobile: width < 760,
+    isTablet: width >= 760 && width < 1024,
+  };
+}
+
+type SearchResult = {
+  id: string;
+  type: 'block' | 'room' | 'map';
+  label: string;
+  subtitle: string;
+  block?: Block;
+  room?: Room;
+  floorName?: string;
+  position: [number, number] | null;
+};
+
 export default function App() {
+  const { isMobile, isTablet } = useViewportFlags();
   const [view, setView] = useState<AppView>('campus');
   const [selectedBlock, setSelectedBlock] = useState<Block | null>(null);
   const [selectedRoom, setSelectedRoom] = useState<{ room: Room; floorName: string } | null>(null);
   const [selectedRisk, setSelectedRisk] = useState<Risk | null>(null);
   const [searchVal, setSearchVal] = useState('');
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [focusTarget, setFocusTarget] = useState<MapFocusTarget | null>(null);
+  const [mapNamedPlaces, setMapNamedPlaces] = useState<MapNamedPlace[]>([]);
+  const [selectedRiskType, setSelectedRiskType] = useState<RiskTypeKey | null>(null);
+
+  useEffect(() => {
+    let active = true;
+
+    fetch(`${import.meta.env.BASE_URL}maps/campus.geojson`)
+      .then(response => response.ok ? response.json() : null)
+      .then((data: CampusMapGeoJSON | null) => {
+        if (!active || !data) return;
+
+        const names = new Map<string, MapNamedPlace>();
+        data.features.forEach(feature => {
+          const name = feature.properties.name;
+          if (!name) return;
+
+          const position = getFeatureCenter(feature);
+          if (!position) return;
+
+          const key = normalizeText(name);
+          if (names.has(key)) return;
+
+          names.set(key, {
+            id: feature.properties.osmId ? `osm-${feature.properties.osmId}` : key,
+            name,
+            kind: feature.properties.kind,
+            position,
+            blockId: getBlockForMapFeature(feature)?.id,
+          });
+        });
+
+        setMapNamedPlaces([...names.values()].sort((a, b) => a.name.localeCompare(b.name)));
+      })
+      .catch(() => {
+        if (active) setMapNamedPlaces([]);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const allSearchResults: SearchResult[] = CAMPUS_DATA.flatMap(block => {
+    const blockPosition = mapNamedPlaces.find(place => place.blockId === block.id)?.position ?? getBlockCoordinate(block);
+    const blockResult: SearchResult = {
+      id: block.id,
+      type: 'block',
+      label: block.name,
+      subtitle: block.fullName,
+      block,
+      position: blockPosition,
+    };
+
+    const roomResults = block.floors.flatMap(floor =>
+      floor.rooms.map(room => ({
+        id: room.id,
+        type: 'room' as const,
+        label: room.name,
+        subtitle: `${block.shortName} · ${floor.name}`,
+        block,
+        room,
+        floorName: floor.name,
+        position: getRoomCoordinate(room, block),
+      }))
+    );
+
+    return [blockResult, ...roomResults];
+  });
+
+  const mapSearchResults: SearchResult[] = mapNamedPlaces
+    .filter(place => !place.blockId)
+    .map(place => ({
+      id: place.id,
+      type: 'map',
+      label: place.name,
+      subtitle: place.kind === 'building' ? 'Nome do prédio no mapa' : 'Nome do mapa',
+      position: place.position,
+    }));
+
+  const query = normalizeText(searchVal.trim());
+  const searchResults = query.length >= 2
+    ? [...allSearchResults, ...mapSearchResults]
+      .filter(result => normalizeText(`${result.label} ${result.subtitle} ${result.block?.name ?? ''} ${result.block?.fullName ?? ''}`).includes(query))
+      .slice(0, 8)
+    : [];
 
   const handleSelectBlock = (id: string) => {
     const block = CAMPUS_DATA.find(b => b.id === id) ?? null;
@@ -1307,6 +1906,23 @@ export default function App() {
   const handleBackToBlock = () => {
     setSelectedRoom(null);
     setSelectedRisk(null);
+  };
+
+  const handleSelectSearchResult = (result: SearchResult) => {
+    setView('campus');
+    setSelectedBlock(result.block ?? null);
+    setSelectedRoom(result.room && result.floorName ? { room: result.room, floorName: result.floorName } : null);
+    setSelectedRisk(null);
+    setSearchVal(result.label);
+    setIsSearchOpen(false);
+
+    if (result.position) {
+      setFocusTarget({
+        id: `${result.id}-${Date.now()}`,
+        position: result.position,
+        zoom: MAP_MAX_ZOOM,
+      });
+    }
   };
 
   if (view === 'engineer') {
@@ -1353,8 +1969,14 @@ export default function App() {
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* Top navigation bar */}
       <header style={{
-        height: 56, background: 'white', borderBottom: '1px solid #e2e8e4',
-        display: 'flex', alignItems: 'center', paddingInline: 20, gap: 16, flexShrink: 0,
+        minHeight: isMobile ? 104 : 56,
+        background: 'white', borderBottom: '1px solid #e2e8e4',
+        display: 'flex',
+        alignItems: isMobile ? 'stretch' : 'center',
+        flexWrap: isMobile ? 'wrap' : 'nowrap',
+        padding: isMobile ? '10px 12px' : '0 20px',
+        gap: isMobile ? 8 : 16,
+        flexShrink: 0,
         boxShadow: '0 1px 4px rgba(0,0,0,0.05)',
       }}>
         {/* Logo */}
@@ -1373,7 +1995,7 @@ export default function App() {
         </div>
 
         {/* Tab nav */}
-        <div style={{ display: 'flex', gap: 2, marginLeft: 8 }}>
+        <div style={{ display: 'flex', gap: 2, marginLeft: isMobile ? 'auto' : 8, order: isMobile ? 2 : 0 }}>
           {['Mapa do Campus', 'Painel Técnico'].map((label, i) => {
             const isActive = i === 0;
             return (
@@ -1381,10 +2003,10 @@ export default function App() {
                 key={label}
                 onClick={() => setView(i === 0 ? 'campus' : 'engineer')}
                 style={{
-                  padding: '6px 14px', borderRadius: 6, border: 'none',
+                  padding: isMobile ? '6px 9px' : '6px 14px', borderRadius: 6, border: 'none',
                   background: isActive ? '#e8f5ee' : 'transparent',
                   color: isActive ? '#1a5c38' : '#6b7f74', fontWeight: isActive ? 600 : 400,
-                  fontSize: 13, cursor: 'pointer',
+                  fontSize: isMobile ? 12 : 13, cursor: 'pointer',
                 }}
               >
                 {label}
@@ -1394,11 +2016,28 @@ export default function App() {
         </div>
 
         {/* Search */}
-        <div style={{ flex: 1, maxWidth: 480, marginInline: 'auto', position: 'relative' }}>
+        <div style={{
+          flex: isMobile ? '1 0 100%' : 1,
+          maxWidth: isMobile ? 'none' : 480,
+          marginInline: isMobile ? 0 : 'auto',
+          position: 'relative',
+          order: isMobile ? 3 : 0,
+        }}>
           <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', fontSize: 13, color: '#6b7f74' }}>⌕</span>
           <input
             value={searchVal}
-            onChange={e => setSearchVal(e.target.value)}
+            onChange={e => {
+              setSearchVal(e.target.value);
+              setIsSearchOpen(true);
+            }}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && searchResults[0]) {
+                handleSelectSearchResult(searchResults[0]);
+              }
+              if (e.key === 'Escape') {
+                setIsSearchOpen(false);
+              }
+            }}
             placeholder="Buscar bloco, sala ou laboratório..."
             style={{
               width: '100%', padding: '8px 12px 8px 34px',
@@ -1406,13 +2045,86 @@ export default function App() {
               fontSize: 13, outline: 'none', background: '#f5f6f8',
               transition: 'border-color 0.15s',
             }}
-            onFocus={e => (e.target.style.borderColor = '#1a5c38')}
-            onBlur={e => (e.target.style.borderColor = '#e2e8e4')}
+            onFocus={e => {
+              e.target.style.borderColor = '#1a5c38';
+              setIsSearchOpen(true);
+            }}
+            onBlur={e => {
+              e.target.style.borderColor = '#e2e8e4';
+              window.setTimeout(() => setIsSearchOpen(false), 120);
+            }}
           />
+          {isSearchOpen && searchVal.trim().length >= 2 && (
+            <div style={{
+              position: 'absolute',
+              top: 'calc(100% + 6px)',
+              left: 0,
+              right: 0,
+              zIndex: 1200,
+              background: 'white',
+              border: '1px solid #e2e8e4',
+              borderRadius: 9,
+              boxShadow: '0 8px 24px rgba(15,26,20,0.14)',
+              overflow: 'hidden',
+            }}>
+              {searchResults.length > 0 ? searchResults.map(result => (
+                <button
+                  key={result.id}
+                  type="button"
+                  onMouseDown={event => {
+                    event.preventDefault();
+                    handleSelectSearchResult(result);
+                  }}
+                  style={{
+                    width: '100%',
+                    border: 'none',
+                    borderBottom: '1px solid #f0f2f4',
+                    background: 'white',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 10,
+                    padding: '10px 12px',
+                    textAlign: 'left',
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = '#f5f8f6')}
+                  onMouseLeave={e => (e.currentTarget.style.background = 'white')}
+                >
+                  <span style={{
+                    width: 28,
+                    height: 28,
+                    borderRadius: 7,
+                    background: result.type === 'block' ? '#e8f5ee' : result.type === 'room' ? '#f7f1ee' : '#edf5ff',
+                    color: result.type === 'block' ? '#1a5c38' : result.type === 'room' ? '#795548' : '#1565c0',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: 11,
+                    fontWeight: 800,
+                    flexShrink: 0,
+                  }}>
+                    {result.type === 'block' ? 'B' : result.type === 'room' ? 'S' : 'M'}
+                  </span>
+                  <span style={{ minWidth: 0 }}>
+                    <span style={{ display: 'block', color: '#0f1a14', fontSize: 13, fontWeight: 750, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {result.label}
+                    </span>
+                    <span style={{ display: 'block', color: '#6b7f74', fontSize: 11, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {result.subtitle}
+                    </span>
+                  </span>
+                </button>
+              )) : (
+                <div style={{ padding: '11px 12px', color: '#6b7f74', fontSize: 12 }}>
+                  Nenhum bloco ou sala encontrado
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* User profile */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+        <div style={{ display: isMobile ? 'none' : 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
           <div style={{
             width: 32, height: 32, borderRadius: 8, background: '#1a5c38',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1438,22 +2150,81 @@ export default function App() {
       )}
 
       {/* Main area */}
-      <main style={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative' }}>
+      <main style={{
+        flex: 1,
+        display: 'flex',
+        flexDirection: isMobile ? 'column-reverse' : 'row',
+        overflow: 'hidden',
+        position: 'relative',
+      }}>
+        {/* Block panel */}
+        {selectedBlock && !selectedRoom && (
+          <BlockPanel
+            block={selectedBlock}
+            onClose={handleCloseBlock}
+            onSelectRoom={handleSelectRoom}
+            selectedRoomId={selectedRoom ? (selectedRoom as any).room.id : null}
+            compact={isMobile}
+            narrow={isTablet}
+          />
+        )}
+
+        {/* Room panel */}
+        {selectedBlock && selectedRoom && (
+          <>
+            {(!isMobile || !selectedRisk) && (
+              <RoomPanel
+                room={selectedRoom.room}
+                floorName={selectedRoom.floorName}
+                block={selectedBlock}
+                onBack={handleBackToBlock}
+                onClose={handleCloseBlock}
+                onSelectRisk={setSelectedRisk}
+                selectedRiskId={selectedRisk?.id ?? null}
+                compact={isMobile}
+                narrow={isTablet}
+              />
+            )}
+            {/* Risk detail drawer */}
+            {selectedRisk && (
+              <RiskDrawer
+                risk={selectedRisk}
+                breadcrumb={riskBreadcrumb}
+                onClose={() => setSelectedRisk(null)}
+                compact={isMobile}
+                narrow={isTablet}
+              />
+            )}
+          </>
+        )}
+
         {/* Map */}
-        <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+        <div style={{
+          flex: 1,
+          minHeight: isMobile ? (selectedBlock ? '44vh' : 0) : undefined,
+          position: 'relative',
+          overflow: 'hidden',
+        }}>
           <CampusMap
             selectedBlockId={selectedBlock?.id ?? null}
             onSelectBlock={handleSelectBlock}
+            focusTarget={focusTarget}
+            selectedRiskType={selectedRiskType}
           />
-          <MapLegend />
+          <MapLegend
+            compact={isMobile || isTablet}
+            selectedType={selectedRiskType}
+            onSelectType={setSelectedRiskType}
+          />
 
           {/* Campus summary overlay */}
           {!selectedBlock && (
             <div style={{
-              position: 'absolute', top: 16, right: 16,
+              position: 'absolute', top: isMobile ? 12 : 16, right: isMobile ? 12 : 16,
               background: 'white', borderRadius: 12, padding: '12px 16px',
               border: '1px solid #e2e8e4', boxShadow: '0 2px 10px rgba(0,0,0,0.08)',
-              minWidth: 200,
+              minWidth: isMobile ? 170 : 200,
+              maxWidth: isMobile ? 210 : undefined,
             }}>
               <div style={{ fontSize: 11, fontWeight: 600, color: '#6b7f74', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>
                 Visão geral do campus
@@ -1474,38 +2245,6 @@ export default function App() {
             </div>
           )}
         </div>
-
-        {/* Block panel */}
-        {selectedBlock && !selectedRoom && (
-          <BlockPanel
-            block={selectedBlock}
-            onClose={handleCloseBlock}
-            onSelectRoom={handleSelectRoom}
-            selectedRoomId={selectedRoom ? (selectedRoom as any).room.id : null}
-          />
-        )}
-
-        {/* Room panel */}
-        {selectedBlock && selectedRoom && (
-          <>
-            <RoomPanel
-              room={selectedRoom.room}
-              floorName={selectedRoom.floorName}
-              block={selectedBlock}
-              onBack={handleBackToBlock}
-              onSelectRisk={setSelectedRisk}
-              selectedRiskId={selectedRisk?.id ?? null}
-            />
-            {/* Risk detail drawer */}
-            {selectedRisk && (
-              <RiskDrawer
-                risk={selectedRisk}
-                breadcrumb={riskBreadcrumb}
-                onClose={() => setSelectedRisk(null)}
-              />
-            )}
-          </>
-        )}
       </main>
     </div>
   );
